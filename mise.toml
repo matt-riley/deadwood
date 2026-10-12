@@ -1,0 +1,46 @@
+[tools]
+rust = { version = "1.99", components = ["rustfmt", "clippy"] }
+actionlint = "1.7.12"
+
+[tasks.install]
+description = "Fetch dependencies"
+run = "cargo fetch --locked"
+
+[tasks.fmt]
+description = "Check formatting"
+run = "cargo fmt --check"
+
+[tasks.lint]
+description = "Lint"
+depends = ["install"]
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.test]
+description = "Test"
+depends = ["install"]
+run = "cargo test --locked"
+
+[tasks.build]
+description = "Build the release binary"
+depends = ["install"]
+run = "cargo build --release --locked"
+
+[tasks.coverage]
+description = "Generate an LCOV coverage report"
+depends = ["install"]
+run = "cargo llvm-cov --lcov --output-path lcov.info"
+
+
+[tasks.compare-knip]
+description = "Compare TypeScript findings with Knip"
+depends = ["build"]
+run = "python3 tests/compare_knip.py"
+
+[tasks.self-scan]
+description = "Run deadwood against its own source"
+depends = ["build", "compare-knip"]
+run = "target/release/deadwood src --max-tokens 2000 --fail-on high"
+
+[tasks.ci]
+description = "Everything CI runs"
+depends = ["fmt", "lint", "test", "build", "self-scan"]

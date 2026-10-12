@@ -1,0 +1,30 @@
+#!/usr/bin/env sh
+set -eu
+
+source_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+stage=$(mktemp -d)
+checkout="$stage/repo"
+trap 'rm -rf "$stage"' EXIT
+
+python3 - "$source_root" "$checkout" <<'PY'
+import shutil
+import sys
+from pathlib import Path
+
+source, destination = map(Path, sys.argv[1:])
+shutil.copytree(
+    source,
+    destination,
+    ignore=shutil.ignore_patterns(".git", "target", "lcov.info", "__pycache__"),
+)
+PY
+
+actionlint_bin=""
+if command -v mise >/dev/null 2>&1; then
+    actionlint_bin=$(mise which actionlint 2>/dev/null || true)
+fi
+if [ -n "$actionlint_bin" ]; then
+    (cd "$checkout" && ACTIONLINT_BIN="$actionlint_bin" .pi/verify)
+else
+    (cd "$checkout" && .pi/verify)
+fi

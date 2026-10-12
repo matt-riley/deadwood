@@ -1,0 +1,66 @@
+#!/usr/bin/env sh
+set -eu
+cd "$(dirname "$0")/.."
+
+# Verification must not accidentally reuse a stale binary or build artifact.
+rm -rf target
+
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --locked
+cargo build --release --locked
+
+tmp=$(mktemp)
+stage=$(mktemp -d)
+trap 'rm -rf "$tmp" "$stage"' EXIT
+
+target/release/deadwood src --max-tokens 2000 --fail-on high >"$tmp"
+python3 tests/compare_knip.py
+
+python3 - "$tmp" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+doc = json.loads(text)
+assert doc["v"] == 1
+assert doc["summary"]["files"] > 0
+assert doc["summary"]["reachable_files"] > 0
+assert len(text) // 4 <= 2000
+assert doc["ok"] is True, doc
+print(f"self-scan ok: {doc['summary']['files']} files, {len(text) // 4} estimated tokens")
+PY
+
+if [ -n "${ACTIONLINT_BIN:-}" ]; then
+  "$ACTIONLINT_BIN" .github/workflows/*.yml
+elif command -v actionlint >/dev/null 2>&1; then
+  actionlint .github/workflows/*.yml
+fi
+python3 .pi/check-workflows.py || test $? -eq 0
+
+python3 - <<'PY'
+import json
+config = json.load(open("release-please-config.json"))
+package = next(iter(config["packages"].values()))
+assert package["release-type"] == "rust"
+assert package["include-component-in-tag"] is False
+assert package["include-v-in-tag"] is True
+assert package["force-tag-creation"] is True
+print("release config ok")
+PY
+
+grep -q 'gh workflow run homebrew.yml' .github/workflows/release.yml
+echo "tag dispatch ok"
+
+cp target/release/deadwood "$stage/deadwood"
+COPYFILE_DISABLE=1 tar -czf "$stage/deadwood.tar.gz" -C "$stage" deadwood
+python3 - "$stage/deadwood.tar.gz" <<'PY'
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1]) as archive:
+    names = [name.lstrip("./") for name in archive.getnames()]
+assert names == ["deadwood"], names
+print("packaging ok")
+PY
