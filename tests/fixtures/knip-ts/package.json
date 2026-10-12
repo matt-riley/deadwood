@@ -1,0 +1,25 @@
+{
+  "name": "deadwood-knip-comparison",
+  "version": "1.0.0",
+  "main": "src/index.ts",
+  "scripts": {
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "used-pkg": "catalog:",
+    "old-pkg": "1.0.0",
+    "catalog-missing": "catalog:tools"
+  },
+  "devDependencies": {
+    "dev-unused": "1.0.0",
+    "typescript": "1.0.0"
+  },
+  "peerDependencies": {
+    "optional-pkg": "1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "optional-pkg": {
+      "optional": true
+    }
+  }
+}
