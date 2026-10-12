@@ -1,0 +1,27 @@
+[package]
+name = "deadwood-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Find unused files, dependencies and symbols across TypeScript, Go, Rust and Lua"
+license = "MIT"
+
+[[bin]]
+name = "deadwood"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tree-sitter = "0.26"
+tree-sitter-go = "0.25"
+tree-sitter-lua = "0.5"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+
+[profile.release]
+lto = true
+strip = true

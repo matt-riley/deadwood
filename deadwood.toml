@@ -1,0 +1,4 @@
+# Optional project configuration.
+# entries = ["src/main.ts"]
+# exclude = ["generated"]
+# include_tests = false
