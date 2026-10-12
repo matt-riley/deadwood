@@ -1,0 +1,168 @@
+name: Release
+
+# Release Please opens a release PR from conventional commits. Merging it creates
+# the release and its tag, then this run builds the binaries and publishes the
+# assets. The tap is updated by homebrew.yml, which has to run on the tag
+# itself -- see the dispatch job below for why.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # Never cancel an in-flight run: a half-published release is worse than a
+  # queued one.
+  group: ${{ github.workflow }}:${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    name: Release Please
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    uses: matt-riley/matt-riley-ci/.github/workflows/release-please.yml@0a310f1286537ed4fd000af4b35cd6459b00448d
+    with:
+      config-file: release-please-config.json
+      manifest-file: .release-please-manifest.json
+    secrets:
+      # Without a token of its own, release-please tags via GITHUB_TOKEN. That
+      # is fine here because everything downstream runs in this same run.
+      token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            os: linux
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            os: linux
+            arch: arm64
+          # An Apple Silicon runner builds both darwin targets; the macOS SDK
+          # ships both architectures, so no extra toolchain is needed.
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            os: darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            os: darwin
+            arch: amd64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCHIVE: deadwood_${{ matrix.os }}_${{ matrix.arch }}.tar.gz
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${TARGET}/release/deadwood" dist/deadwood
+          # COPYFILE_DISABLE stops BSD tar storing AppleDouble metadata, which
+          # would otherwise land a stray ._deadwood beside the binary on Linux.
+          COPYFILE_DISABLE=1 tar -czf "dist/${ARCHIVE}" -C dist deadwood
+          tar -tzf "dist/${ARCHIVE}"
+          ls -l "dist/${ARCHIVE}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: deadwood-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: [release-please, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    environment: release
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: deadwood-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum ./*.tar.gz > checksums.txt
+          cat checksums.txt
+
+      # Release Please leaves a draft release, so the assets land before the
+      # release goes public. The tag already exists (force-tag-creation), which
+      # is what lets the next run find this release as its baseline.
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --generate-notes \
+              --draft
+          fi
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+
+  dispatch-homebrew:
+    name: Start tap publisher
+    needs: [release-please, publish]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      # The tag is the only ref homebrew-formula.yml trusts, and a tag created
+      # with GITHUB_TOKEN starts nothing. workflow_dispatch is the one event
+      # GITHUB_TOKEN can still raise, so ask for a run at the tag. A release
+      # token, if configured, starts it from the tag push instead.
+      - name: Dispatch the tap publisher at the release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          RELEASE_TOKEN_AVAILABLE: ${{ secrets.RELEASE_PLEASE_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE_TOKEN_AVAILABLE" = true ]; then
+            echo 'A release token is configured, so the tag starts the publisher itself.'
+          else
+            gh workflow run homebrew.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG"
+          fi

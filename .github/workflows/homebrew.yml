@@ -1,0 +1,49 @@
+name: Homebrew
+
+# homebrew-formula.yml publishes only from a run the release tag itself
+# triggered: it requires GITHUB_REF to be refs/tags/<tag>, and refuses
+# anything else. A tag created with GITHUB_TOKEN starts no workflow, so
+# Release dispatches this at the tag. With a release token configured the tag
+# push starts it directly instead.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  # Never cancel: a half-updated tap is worse than a queued run.
+  group: ${{ github.workflow }}:${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  homebrew:
+    name: Homebrew tap
+    permissions:
+      contents: read
+    # Needs the commit that taught homebrew-formula.yml to mint from a GitHub
+    # App (4.1.0); that lets the tap run on a short-lived installation token
+    # scoped to one repository instead of a long-lived PAT.
+    uses: matt-riley/matt-riley-ci/.github/workflows/homebrew-formula.yml@0a310f1286537ed4fd000af4b35cd6459b00448d
+    with:
+      # A tag push or a dispatch at the tag both land here with ref_name set to
+      # the tag, which is the ref homebrew-formula.yml will re-check.
+      tag: ${{ github.ref_name }}
+      formula-name: deadwood
+      class-name: Deadwood
+      desc: Unused file and dependency analysis for TypeScript, Rust, Go and Lua
+      homepage: https://github.com/matt-riley/deadwood
+      license: MIT
+      binary: deadwood
+      archive-x86_64-macos: deadwood_darwin_amd64.tar.gz
+      archive-aarch64-macos: deadwood_darwin_arm64.tar.gz
+      archive-x86_64-linux: deadwood_linux_amd64.tar.gz
+      archive-aarch64-linux: deadwood_linux_arm64.tar.gz
+      # APP_ID is the tap App, the same one the GoReleaser repos use.
+      tap-app-id: ${{ vars.APP_ID }}
+    secrets:
+      private-key: ${{ secrets.PRIVATE_KEY }}
+      # Used only when the App is unconfigured or its mint failed.
+      homebrew-tap-token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN || secrets.TAP_TOKEN }}

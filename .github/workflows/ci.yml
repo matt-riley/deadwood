@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux
+    permissions:
+      contents: read
+    concurrency:
+      group: ${{ github.workflow }}:${{ github.ref }}:linux
+      cancel-in-progress: true
+    uses: matt-riley/matt-riley-ci/.github/workflows/ci.yml@0a310f1286537ed4fd000af4b35cd6459b00448d
+    with:
+      fmt: true
+      lint: true
+      test: true
+      build: true
+
+  macos:
+    name: macOS
+    permissions:
+      contents: read
+    concurrency:
+      group: ${{ github.workflow }}:${{ github.ref }}:macos
+      cancel-in-progress: true
+    uses: matt-riley/matt-riley-ci/.github/workflows/ci.yml@0a310f1286537ed4fd000af4b35cd6459b00448d
+    with:
+      runner: macos-latest
+      test: true
+
+  # The shared workflow does not run the analyzer against its own source, so
+  # keep that invariant as a separate CI job.
+  self-scan:
+    name: Self-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    concurrency:
+      group: ${{ github.workflow }}:${{ github.ref }}:self-scan
+      cancel-in-progress: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+      - name: Install mise
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea
+        with:
+          version: 2026.9.18
+          add_shims_to_path: false
+      - name: Expose installed tool binaries
+        shell: bash
+        run: |
+          mise bin-paths > "$RUNNER_TEMP/mise-bin-paths"
+          while IFS= read -r directory; do
+            if [ -d "$directory" ]; then printf '%s\n' "$directory" >> "$GITHUB_PATH"; fi
+          done < "$RUNNER_TEMP/mise-bin-paths"
+      - name: Run Deadwood verification
+        run: mise run self-scan
