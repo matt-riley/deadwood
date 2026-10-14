@@ -6,6 +6,8 @@ cd "$(dirname "$0")/.."
 rm -rf target
 
 cargo fmt --check
+test -z "$(gofmt -l backends/go/*.go)"
+(cd backends/go && go mod download && go vet ./... && go test -mod=readonly -coverprofile=coverage.out ./...)
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
@@ -14,7 +16,7 @@ tmp=$(mktemp)
 stage=$(mktemp -d)
 trap 'rm -rf "$tmp" "$stage"' EXIT
 
-target/release/deadwood src --max-tokens 2000 --fail-on high >"$tmp"
+target/release/deadwood . --semantic-go --max-tokens 2000 --fail-on high >"$tmp"
 python3 tests/compare_knip.py
 
 python3 - "$tmp" <<'PY'
@@ -29,6 +31,10 @@ assert doc["summary"]["files"] > 0
 assert doc["summary"]["reachable_files"] > 0
 assert len(text) // 4 <= 2000
 assert doc["ok"] is True, doc
+assert len(doc["analysis"]) == 1, doc
+analysis = doc["analysis"][0]
+assert analysis["language"] == "Go" and analysis["complete"] is True
+assert analysis["declarations"] > 0 and analysis["references"] > 0 and analysis["roots"] > 0, analysis
 print(f"self-scan ok: {doc['summary']['files']} files, {len(text) // 4} estimated tokens")
 PY
 

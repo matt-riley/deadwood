@@ -15,9 +15,12 @@ source, destination = map(Path, sys.argv[1:])
 shutil.copytree(
     source,
     destination,
-    ignore=shutil.ignore_patterns(".git", "target", "lcov.info", "__pycache__"),
+    ignore=shutil.ignore_patterns(".git", "target", "lcov.info", "coverage.out", "__pycache__", ".deadwood-cache", ".deadwood-backup"),
 )
 PY
+
+# Trust only this disposable copy of the repository, not the parent temp tree.
+export MISE_TRUSTED_CONFIG_PATHS="$checkout"
 
 actionlint_bin=""
 if command -v mise >/dev/null 2>&1; then

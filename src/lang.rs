@@ -5,7 +5,7 @@ use tree_sitter::Language as TsLanguage;
 pub fn from_path(path: &Path) -> Option<Language> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
-        "ts" | "mts" | "cts" => Some(Language::TypeScript),
+        "ts" | "mts" | "cts" | "js" | "mjs" | "cjs" => Some(Language::TypeScript),
         "tsx" | "jsx" => Some(Language::Tsx),
         "go" => Some(Language::Go),
         "rs" => Some(Language::Rust),

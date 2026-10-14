@@ -3,3 +3,7 @@
 *.swp
 .DS_Store
 /lcov.info
+/.deadwood-cache/
+/.deadwood-backup/
+/.pi/cache/
+coverage.out

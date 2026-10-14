@@ -1,6 +1,12 @@
+pub mod cache;
+pub mod conditions;
 pub mod discover;
+pub mod fix;
+pub mod go;
 pub mod lang;
 pub mod model;
+pub mod output;
 pub mod parse;
 pub mod report;
 pub mod resolve;
+pub mod semantic;

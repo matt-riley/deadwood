@@ -1,24 +1,25 @@
 [tools]
 rust = { version = "1.99", components = ["rustfmt", "clippy"] }
 actionlint = "1.7.12"
+go = "1.27.1"
 
 [tasks.install]
 description = "Fetch dependencies"
-run = "cargo fetch --locked"
+run = ["cargo fetch --locked", "cd backends/go && go mod download"]
 
 [tasks.fmt]
 description = "Check formatting"
-run = "cargo fmt --check"
+run = ["cargo fmt --check", 'test -z "$(gofmt -l backends/go/*.go)"']
 
 [tasks.lint]
 description = "Lint"
 depends = ["install"]
-run = "cargo clippy --all-targets -- -D warnings"
+run = ["cargo clippy --all-targets -- -D warnings", "cd backends/go && go vet ./..."]
 
 [tasks.test]
 description = "Test"
 depends = ["install"]
-run = "cargo test --locked"
+run = ["cargo test --locked", "cd backends/go && go test -mod=readonly ./..."]
 
 [tasks.build]
 description = "Build the release binary"
@@ -28,7 +29,7 @@ run = "cargo build --release --locked"
 [tasks.coverage]
 description = "Generate an LCOV coverage report"
 depends = ["install"]
-run = "cargo llvm-cov --lcov --output-path lcov.info"
+run = ["cargo llvm-cov --lcov --output-path lcov.info", "cd backends/go && go test -coverprofile=coverage.out ./..."]
 
 
 [tasks.compare-knip]
@@ -39,7 +40,7 @@ run = "python3 tests/compare_knip.py"
 [tasks.self-scan]
 description = "Run deadwood against its own source"
 depends = ["build", "compare-knip"]
-run = "target/release/deadwood src --max-tokens 2000 --fail-on high"
+run = ["target/release/deadwood . --semantic-go --max-tokens 2000 --fail-on high", "target/release/deadwood backends/go --semantic-go --max-tokens 2000 --fail-on high"]
 
 [tasks.ci]
 description = "Everything CI runs"

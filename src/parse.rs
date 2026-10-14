@@ -8,6 +8,20 @@ use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
 
 pub fn parse(path: PathBuf, display_path: String, source: &str) -> FileRecord {
+    parse_with(path, display_path, source, &crate::model::Config::default())
+}
+pub fn parse_with(
+    path: PathBuf,
+    display_path: String,
+    original: &str,
+    config: &crate::model::Config,
+) -> FileRecord {
+    let processed = if lang::from_path(Path::new(&display_path)) == Some(Language::Rust) {
+        crate::conditions::rust_source(original, config)
+    } else {
+        original.to_string()
+    };
+    let source = processed.as_str();
     let language = lang::from_path(Path::new(&display_path)).expect("parse called for source path");
     let mut parser = Parser::new();
     parser
@@ -43,12 +57,68 @@ pub fn parse(path: PathBuf, display_path: String, source: &str) -> FileRecord {
         &mut has_main,
     );
 
+    let mut class_members = Vec::new();
+    for class in descendants(tree.root_node(), "class_declaration") {
+        if !descendants(class, "decorator").is_empty() {
+            continue;
+        }
+        if let Some(namespace) = class.child_by_field_name("name") {
+            for kind in ["method_definition", "public_field_definition"] {
+                for member in descendants(class, kind) {
+                    if let Some(name) = member.child_by_field_name("name") {
+                        let name = text(name, source.as_bytes());
+                        if name == "constructor"
+                            || text(member, source.as_bytes())
+                                .split_whitespace()
+                                .any(|word| word == "override")
+                        {
+                            continue;
+                        }
+                        if !matches!(
+                            member.child_by_field_name("name").unwrap().kind(),
+                            "property_identifier" | "private_property_identifier"
+                        ) {
+                            continue;
+                        }
+                        class_members.push(NamespaceMember {
+                            namespace: text(namespace, source.as_bytes()),
+                            name,
+                            line: member.start_position().row as u32 + 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let mut dynamic_references = Vec::new();
+    resources(
+        tree.root_node(),
+        source.as_bytes(),
+        language,
+        &mut imports,
+        &mut dynamic_references,
+    );
+    for symbol in &mut symbols {
+        symbol.public |= match language {
+            Language::Go => symbol.name.chars().next().is_some_and(char::is_uppercase),
+            Language::Rust => source
+                .lines()
+                .nth(symbol.line.saturating_sub(1) as usize)
+                .is_some_and(|line| line.trim_start().starts_with("pub ")),
+            Language::Lua => source.contains(&format!("return {}", symbol.name)),
+            _ => false,
+        };
+    }
     if language == Language::Rust {
         filter_rust_scoped_imports(&mut imports, source);
     }
 
     FileRecord {
+        dynamic_references,
+        class_members,
+        compiled: false,
         path,
+        source: original.to_string(),
         display_path: display_path.clone(),
         language,
         imports,
@@ -215,7 +285,19 @@ fn visit_typescript(
         } else {
             ImportKind::Package
         };
+        let specs = descendants(
+            node,
+            if node.kind() == "import_statement" {
+                "import_specifier"
+            } else {
+                "export_specifier"
+            },
+        );
+        let type_only = has_token(node, "type")
+            || (!specs.is_empty() && specs.iter().all(|n| has_token(*n, "type")));
         imports.push(Import {
+            public: false,
+            type_only,
             alias: None,
             raw: raw.clone(),
             line: node.start_position().row as u32 + 1,
@@ -223,7 +305,11 @@ fn visit_typescript(
         });
         let bindings = symbol_bindings(node, source);
         if !bindings.is_empty() {
-            symbol_imports.push(SymbolImport { raw, bindings });
+            symbol_imports.push(SymbolImport {
+                raw,
+                bindings,
+                reexport: node.kind() == "export_statement",
+            });
         }
     }
 
@@ -236,15 +322,75 @@ fn visit_typescript(
             && let Some(raw) = first_string_child(arguments, source)
         {
             imports.push(Import {
+                public: false,
+                type_only: false,
                 alias: None,
                 kind: if is_relative(&raw) {
                     ImportKind::Module
                 } else {
                     ImportKind::Package
                 },
-                raw,
+                raw: raw.clone(),
                 line: node.start_position().row as u32 + 1,
             });
+            if name == "require"
+                && let Some(parent) = node.parent().filter(|n| n.kind() == "variable_declarator")
+                && let Some(pattern) = parent.child_by_field_name("name")
+            {
+                let bindings = if pattern.kind() == "identifier" {
+                    vec![SymbolBinding {
+                        imported: "*".into(),
+                        local: text(pattern, source),
+                    }]
+                } else {
+                    pattern_names(pattern, source)
+                };
+                symbol_imports.push(SymbolImport {
+                    raw,
+                    bindings,
+                    reexport: false,
+                });
+            }
+        }
+    }
+    if node.kind() == "assignment_expression"
+        && let (Some(left), Some(right)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        )
+    {
+        let lhs = text(left, source);
+        let line = node.start_position().row as u32 + 1;
+        let add = |name: String, exports: &mut Vec<ExportSymbol>| {
+            exports.push(ExportSymbol {
+                name,
+                line,
+                kind: SymbolKind::Value,
+            })
+        };
+        if lhs == "module.exports" {
+            if right.kind() == "object" {
+                let mut c = right.walk();
+                for item in right.named_children(&mut c) {
+                    match item.kind() {
+                        "shorthand_property_identifier" => add(text(item, source), exports),
+                        "pair" => {
+                            if let Some(key) = item.child_by_field_name("key") {
+                                add(text(key, source).trim_matches(['\'', '"']).into(), exports);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                add("default".into(), exports);
+            }
+        } else if let Some(name) = lhs
+            .strip_prefix("exports.")
+            .or_else(|| lhs.strip_prefix("module.exports."))
+            && is_identifier(name)
+        {
+            add(name.into(), exports);
         }
     }
 }
@@ -309,67 +455,64 @@ fn is_identifier(value: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric() || ch == '$')
 }
 
-fn symbol_bindings(node: Node<'_>, source: &[u8]) -> Vec<SymbolBinding> {
-    let raw = text(node, source);
-    let keyword = if node.kind() == "import_statement" {
-        "import"
-    } else {
-        "export"
-    };
-    let body = raw
-        .strip_prefix(keyword)
-        .unwrap_or(&raw)
-        .split(" from ")
-        .next()
-        .unwrap_or("")
-        .trim();
-    if let Some(body) = body.strip_prefix("type ") {
-        return symbol_bindings_from_body(node.kind(), body.trim());
+fn descendants<'a>(node: Node<'a>, kind: &str) -> Vec<Node<'a>> {
+    let mut result = Vec::new();
+    if node.kind() == kind {
+        result.push(node);
     }
-    symbol_bindings_from_body(node.kind(), body)
+    let mut c = node.walk();
+    for child in node.named_children(&mut c) {
+        result.extend(descendants(child, kind));
+    }
+    result
 }
-
-fn symbol_bindings_from_body(node_kind: &str, body: &str) -> Vec<SymbolBinding> {
-    if body.starts_with('*') {
-        let local = body.split(" as ").nth(1).map(str::trim).unwrap_or("*");
-        return vec![SymbolBinding {
-            imported: "*".to_string(),
-            local: local.to_string(),
-        }];
-    }
+fn symbol_bindings(node: Node<'_>, source: &[u8]) -> Vec<SymbolBinding> {
     let mut bindings = Vec::new();
-    if let (Some(open), Some(close)) = (body.find('{'), body.find('}')) {
-        if node_kind == "import_statement" {
-            let default = body[..open].trim().trim_end_matches(',').trim();
-            if !default.is_empty() {
+    for kind in ["import_specifier", "export_specifier"] {
+        for item in descendants(node, kind) {
+            if let Some(name) = item.child_by_field_name("name") {
+                let imported = text(name, source).trim_matches(['\'', '"']).to_string();
+                let local = item
+                    .child_by_field_name("alias")
+                    .map(|n| text(n, source).trim_matches(['\'', '"']).to_string())
+                    .unwrap_or_else(|| imported.clone());
+                bindings.push(SymbolBinding { imported, local });
+            }
+        }
+    }
+    for kind in ["namespace_import", "namespace_export"] {
+        for item in descendants(node, kind) {
+            bindings.push(SymbolBinding {
+                imported: "*".into(),
+                local: item
+                    .named_child(0)
+                    .map(|n| text(n, source))
+                    .unwrap_or_else(|| "*".into()),
+            });
+        }
+    }
+    if node.kind() == "import_statement" {
+        for clause in descendants(node, "import_clause") {
+            let mut c = clause.walk();
+            for item in clause
+                .named_children(&mut c)
+                .filter(|n| n.kind() == "identifier")
+            {
                 bindings.push(SymbolBinding {
-                    imported: "default".to_string(),
-                    local: default.to_string(),
+                    imported: "default".into(),
+                    local: text(item, source),
                 });
             }
         }
-        bindings.extend(body[open + 1..close].split(',').filter_map(|item| {
-            let item = item.trim();
-            if item.is_empty() {
-                return None;
-            }
-            let item = item.strip_prefix("type ").unwrap_or(item).trim();
-            let mut parts = item.split(" as ").map(str::trim);
-            let imported = parts.next()?.to_string();
-            let local = parts.next().unwrap_or(&imported).to_string();
-            Some(SymbolBinding { imported, local })
-        }));
-        return bindings;
-    }
-    if node_kind == "import_statement"
-        && !body.is_empty()
-        && !body.starts_with('"')
-        && !body.starts_with('\'')
+    } else if text(node, source)
+        .trim_start()
+        .strip_prefix("export")
+        .is_some_and(|s| s.trim_start().starts_with('*'))
+        && bindings.is_empty()
     {
-        let local = body.split(',').next().unwrap_or(body).trim();
         bindings.push(SymbolBinding {
-            imported: "default".to_string(),
-            local: local.to_string(),
+            imported: "*".into(),
+            local: "*".into(),
         });
     }
     bindings
@@ -453,106 +596,68 @@ fn declaration_body(source: &str, keyword: &str) -> Option<(String, String)> {
 }
 
 fn top_level_exports(body: &str) -> Vec<String> {
-    let bytes = body.as_bytes();
-    let mut positions = Vec::new();
-    let mut depth = 0;
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'{' {
-            depth += 1;
-        } else if bytes[index] == b'}' {
-            depth -= 1;
-        } else if depth == 0
-            && bytes[index..].starts_with(b"export")
-            && (index == 0 || !bytes[index - 1].is_ascii_alphanumeric())
-        {
-            positions.push(index + "export".len());
-            index += "export".len();
-            continue;
-        }
-        index += 1;
-    }
-    positions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, start)| {
-            let end = positions.get(index + 1).copied().unwrap_or(body.len());
-            export_names_without_default(body[*start..end].trim())
-                .into_iter()
-                .next()
-        })
+    let mut parser = Parser::new();
+    parser
+        .set_language(&lang::grammar(Language::TypeScript))
+        .unwrap();
+    let tree = parser.parse(body, None).unwrap();
+    let mut c = tree.root_node().walk();
+    tree.root_node()
+        .named_children(&mut c)
+        .filter(|n| n.kind() == "export_statement")
+        .flat_map(|n| export_names(n, body.as_bytes()))
         .collect()
 }
 
 fn export_names(node: Node<'_>, source: &[u8]) -> Vec<String> {
-    let source_text = text(node, source);
-    let after_export = source_text
-        .trim()
+    if text(node, source)
+        .trim_start()
         .strip_prefix("export")
-        .unwrap_or("")
-        .trim();
-    if after_export.starts_with("default") {
-        return vec!["default".to_string()];
-    }
-    if let Some(raw) = after_export.strip_prefix("type ")
-        && raw.trim_start().starts_with('{')
+        .is_some_and(|s| s.trim_start().starts_with("default"))
     {
-        return export_names_without_default(raw.trim());
+        return vec!["default".into()];
     }
-    export_names_without_default(after_export)
+    if let Some(declaration) = node.child_by_field_name("declaration") {
+        if let Some(name) = declaration.child_by_field_name("name") {
+            return vec![text(name, source)];
+        }
+        let mut names = Vec::new();
+        for declarator in descendants(declaration, "variable_declarator") {
+            if let Some(pattern) = declarator.child_by_field_name("name") {
+                names.extend(pattern_names(pattern, source).into_iter().map(|b| b.local));
+            }
+        }
+        return names;
+    }
+    symbol_bindings(node, source)
+        .into_iter()
+        .filter(|b| b.local != "*")
+        .map(|b| b.local)
+        .collect()
 }
-
-fn export_names_without_default(raw: &str) -> Vec<String> {
-    if raw.starts_with('*') {
-        return Vec::new();
-    }
-    if raw.starts_with('{')
-        && let (Some(open), Some(close)) = (raw.find('{'), raw.find('}'))
-    {
-        return raw[open + 1..close]
-            .split(',')
-            .filter_map(|item| {
-                item.trim()
-                    .strip_prefix("type ")
-                    .unwrap_or(item.trim())
-                    .split(" as ")
-                    .next()
+fn pattern_names(node: Node<'_>, source: &[u8]) -> Vec<SymbolBinding> {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => vec![SymbolBinding {
+            imported: text(node, source),
+            local: text(node, source),
+        }],
+        "pair_pattern" => node
+            .child_by_field_name("key")
+            .zip(node.child_by_field_name("value"))
+            .map(|(key, value)| {
+                vec![SymbolBinding {
+                    imported: text(key, source),
+                    local: text(value, source),
+                }]
             })
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .collect();
-    }
-    for keyword in ["const", "let", "var"] {
-        if let Some(rest) = raw.strip_prefix(keyword) {
-            let name = rest
-                .trim()
-                .split([',', '=', ';'])
-                .next()
-                .unwrap_or("")
-                .trim();
-            if !name.is_empty() {
-                return vec![name.to_string()];
-            }
+            .unwrap_or_default(),
+        _ => {
+            let mut c = node.walk();
+            node.named_children(&mut c)
+                .flat_map(|n| pattern_names(n, source))
+                .collect()
         }
     }
-    for keyword in [
-        "function",
-        "class",
-        "interface",
-        "type",
-        "enum",
-        "namespace",
-    ] {
-        if let Some(rest) = raw.strip_prefix(keyword) {
-            let name = rest
-                .split([' ', '{', '<', '='])
-                .find(|part| !part.is_empty());
-            if let Some(name) = name {
-                return vec![name.to_string()];
-            }
-        }
-    }
-    Vec::new()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -566,7 +671,9 @@ fn visit_go(
     package: &mut Option<String>,
     has_main: &mut bool,
 ) {
-    if matches!(node.kind(), "identifier" | "field_identifier") {
+    if matches!(node.kind(), "identifier" | "field_identifier")
+        && !shadowed(node, source, Language::Go)
+    {
         symbol_references.push(text(node, source));
     }
     if node.kind() == "selector_expression"
@@ -592,12 +699,24 @@ fn visit_go(
             if name == "main" {
                 *has_main = true;
             }
+            let contract = node.kind() == "method_declaration"
+                && name.chars().next().is_some_and(char::is_uppercase)
+                || ["Test", "Benchmark", "Fuzz", "Example"]
+                    .iter()
+                    .any(|prefix| {
+                        name.strip_prefix(prefix).is_some_and(|rest| {
+                            rest.is_empty() || rest.chars().next().is_some_and(char::is_uppercase)
+                        })
+                    });
             add_symbol(
                 symbols,
                 name,
                 node.start_position().row as u32 + 1,
                 SymbolKind::Value,
             );
+            if let Some(symbol) = symbols.last_mut() {
+                symbol.contract = contract;
+            }
         }
     } else if matches!(node.kind(), "type_spec" | "const_spec" | "var_spec")
         && let Some(name) = node.child_by_field_name("name")
@@ -619,6 +738,8 @@ fn visit_go(
         && let Some(raw) = string_literal(path, source)
     {
         imports.push(Import {
+            public: false,
+            type_only: false,
             alias: node
                 .child_by_field_name("name")
                 .map(|name| text(name, source))
@@ -630,65 +751,77 @@ fn visit_go(
     }
 }
 
-fn filter_rust_scoped_imports(imports: &mut Vec<Import>, source: &str) {
-    let aliases: HashSet<String> = imports
+fn filter_rust_scoped_imports(imports: &mut Vec<Import>, _source: &str) {
+    let aliases: HashSet<_> = imports
         .iter()
-        .filter(|import| {
-            import.kind == ImportKind::RustUse
-                && source
-                    .lines()
-                    .nth(import.line.saturating_sub(1) as usize)
-                    .is_some_and(|line| line.trim_start().starts_with("use "))
-        })
-        .flat_map(|import| {
-            let path = import.raw.split(" as ").next().unwrap_or(&import.raw);
-            let path = path.split("::{").next().unwrap_or(path);
-            let mut aliases = vec![
-                path.split("::").next().unwrap_or(path).to_string(),
-                path.rsplit("::").next().unwrap_or(path).to_string(),
-            ];
-            if let Some(members) = import.raw.split("::{").nth(1) {
-                aliases.extend(
-                    members
-                        .split('}')
-                        .next()
-                        .unwrap_or(members)
-                        .split(',')
-                        .filter_map(|member| {
-                            let member = member.split(" as ").last()?.trim();
-                            (!member.is_empty()).then(|| member.to_string())
-                        }),
-                );
+        .filter(|i| i.kind == ImportKind::RustUse)
+        .filter_map(|i| i.alias.clone())
+        .collect();
+    imports.retain(|i| {
+        i.kind != ImportKind::RustUse
+            || i.alias.is_some()
+            || !aliases.contains(i.raw.split("::").next().unwrap_or(&i.raw))
+    });
+}
+fn rust_use(node: Node<'_>, prefix: &str, source: &[u8]) -> Vec<(String, String)> {
+    match node.kind() {
+        "use_list" => {
+            let mut c = node.walk();
+            node.named_children(&mut c)
+                .flat_map(|n| rust_use(n, prefix, source))
+                .collect()
+        }
+        "scoped_use_list" => {
+            let path = node
+                .child_by_field_name("path")
+                .map(|n| text(n, source))
+                .unwrap_or_default();
+            let prefix = if prefix.is_empty() {
+                path
+            } else if path.is_empty() {
+                prefix.into()
+            } else {
+                format!("{prefix}::{path}")
+            };
+            node.child_by_field_name("list")
+                .map(|n| rust_use(n, &prefix, source))
+                .unwrap_or_default()
+        }
+        "use_as_clause" => {
+            let mut uses = node
+                .child_by_field_name("path")
+                .map(|n| rust_use(n, prefix, source))
+                .unwrap_or_default();
+            if let Some(alias) = node.child_by_field_name("alias") {
+                for (_, local) in &mut uses {
+                    *local = text(alias, source);
+                }
             }
-            aliases
-        })
-        .collect();
-    let declarations: HashSet<(u32, String)> = imports
-        .iter()
-        .filter(|import| {
-            import.kind == ImportKind::RustUse
-                && source
-                    .lines()
-                    .nth(import.line.saturating_sub(1) as usize)
-                    .is_some_and(|line| line.trim_start().starts_with("use "))
-        })
-        .map(|import| (import.line, import.raw.clone()))
-        .collect();
-    imports.retain(|import| {
-        if import.kind != ImportKind::RustUse {
+            uses
+        }
+        _ => {
+            let path = text(node, source);
+            let raw = if prefix.is_empty() {
+                path.clone()
+            } else if path == "self" {
+                prefix.into()
+            } else {
+                format!("{prefix}::{path}")
+            };
+            let alias = raw.rsplit("::").next().unwrap_or(&raw).to_string();
+            vec![(raw, alias)]
+        }
+    }
+}
+fn inside(node: Node<'_>, kind: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == kind {
             return true;
         }
-        let first = import.raw.split("::").next().unwrap_or(&import.raw);
-        let line_is_use = source
-            .lines()
-            .nth(import.line.saturating_sub(1) as usize)
-            .is_some_and(|line| line.trim_start().starts_with("use "));
-        if line_is_use {
-            declarations.contains(&(import.line, import.raw.clone()))
-        } else {
-            !aliases.contains(first)
-        }
-    });
+        current = n.parent();
+    }
+    false
 }
 
 fn visit_rust(
@@ -703,7 +836,8 @@ fn visit_rust(
     if matches!(
         node.kind(),
         "identifier" | "type_identifier" | "field_identifier"
-    ) {
+    ) && !shadowed(node, source, Language::Rust)
+    {
         symbol_references.push(text(node, source));
     }
     if matches!(
@@ -739,6 +873,46 @@ fn visit_rust(
         }
     }
 
+    if matches!(
+        node.kind(),
+        "function_item" | "trait_item" | "struct_item" | "enum_item"
+    ) {
+        let mut contract = inside(node, "trait_item");
+        let mut ancestor = node.parent();
+        while let Some(parent) = ancestor {
+            if parent.kind() == "impl_item" && parent.child_by_field_name("trait").is_some() {
+                contract = true;
+            }
+            ancestor = parent.parent();
+        }
+        let mut previous = node.prev_named_sibling();
+        while let Some(attribute) = previous.filter(|n| {
+            matches!(
+                n.kind(),
+                "attribute_item" | "line_comment" | "block_comment"
+            )
+        }) {
+            let raw = text(attribute, source);
+            if raw == "#[test]" || raw.contains("::test]") || raw.starts_with("#[rstest") {
+                contract = true;
+            }
+            previous = attribute.prev_named_sibling();
+        }
+        if let Some(name) = node.child_by_field_name("name") {
+            let name = text(name, source);
+            if let Some(symbol) = symbols
+                .iter_mut()
+                .find(|s| s.name == name && s.line == node.start_position().row as u32 + 1)
+            {
+                symbol.contract = contract;
+                let mut c = node.walk();
+                symbol.public = node
+                    .named_children(&mut c)
+                    .any(|n| n.kind() == "visibility_modifier" && text(n, source) == "pub");
+            }
+        }
+    }
+
     if node.kind() == "scoped_identifier" {
         let raw = text(node, source);
         let parts: Vec<_> = raw.split("::").collect();
@@ -750,7 +924,7 @@ fn visit_rust(
         }
     }
 
-    if node.kind() == "scoped_identifier" {
+    if node.kind() == "scoped_identifier" && !inside(node, "use_declaration") {
         let raw = text(node, source);
         let first = raw.split("::").next().unwrap_or("");
         if !matches!(first, "crate" | "self" | "super" | "std" | "core" | "alloc")
@@ -760,6 +934,8 @@ fn visit_rust(
                 .is_some_and(|ch| ch.is_ascii_lowercase())
         {
             imports.push(Import {
+                public: false,
+                type_only: false,
                 alias: None,
                 raw,
                 line: node.start_position().row as u32 + 1,
@@ -773,6 +949,12 @@ fn visit_rust(
         && let Some(name) = node.child_by_field_name("name")
     {
         imports.push(Import {
+            public: {
+                let mut c = node.walk();
+                node.named_children(&mut c)
+                    .any(|n| n.kind() == "visibility_modifier" && text(n, source) == "pub")
+            },
+            type_only: false,
             alias: None,
             raw: text(name, source),
             line: node.start_position().row as u32 + 1,
@@ -780,18 +962,14 @@ fn visit_rust(
         });
     }
 
-    if node.kind() == "use_declaration" {
-        let raw = text(node, source)
-            .trim()
-            .strip_prefix("use")
-            .unwrap_or("")
-            .trim()
-            .trim_end_matches(';')
-            .trim()
-            .to_string();
-        if !raw.is_empty() {
+    if node.kind() == "use_declaration"
+        && let Some(argument) = node.child_by_field_name("argument")
+    {
+        for (raw, alias) in rust_use(argument, "", source) {
             imports.push(Import {
-                alias: None,
+                public: false,
+                type_only: false,
+                alias: Some(alias),
                 raw,
                 line: node.start_position().row as u32 + 1,
                 kind: ImportKind::RustUse,
@@ -823,7 +1001,12 @@ fn visit_lua(
     symbol_references: &mut Vec<String>,
     member_references: &mut Vec<MemberReference>,
 ) {
-    if matches!(node.kind(), "identifier" | "dot_index_expression") {
+    if matches!(node.kind(), "identifier" | "dot_index_expression")
+        && !(node.kind() == "identifier"
+            && node
+                .parent()
+                .is_some_and(|p| p.kind() == "dot_index_expression"))
+    {
         let name = text(node, source);
         symbol_references.push(name.rsplit(['.', ':']).next().unwrap_or(&name).to_string());
     }
@@ -849,6 +1032,11 @@ fn visit_lua(
             node.start_position().row as u32 + 1,
             SymbolKind::Value,
         );
+        if name.starts_with("love.")
+            && let Some(symbol) = symbols.last_mut()
+        {
+            symbol.contract = true;
+        }
     }
     if node.kind() == "variable_declaration"
         && let Some(list) = node.named_child(0)
@@ -874,6 +1062,8 @@ fn visit_lua(
     for name in ["require", "dofile", "loadfile"] {
         if let Some(raw) = literal_call_argument(&call, name) {
             imports.push(Import {
+                public: false,
+                type_only: false,
                 alias: None,
                 raw,
                 line: node.start_position().row as u32 + 1,
@@ -889,7 +1079,13 @@ fn add_symbol(symbols: &mut Vec<SymbolDefinition>, name: String, line: u32, kind
         .iter()
         .any(|symbol| symbol.name == name && symbol.line == line)
     {
-        symbols.push(SymbolDefinition { name, line, kind });
+        symbols.push(SymbolDefinition {
+            contract: false,
+            name,
+            line,
+            kind,
+            public: false,
+        });
     }
 }
 
@@ -946,6 +1142,147 @@ fn is_test_path(path: &str) -> bool {
         || lower.ends_with(".spec.ts")
         || lower.ends_with(".spec.tsx")
         || lower.ends_with("_test.rs")
+}
+
+fn resources(
+    node: Node<'_>,
+    source: &[u8],
+    language: Language,
+    imports: &mut Vec<Import>,
+    dynamic: &mut Vec<String>,
+) {
+    let callable = match language {
+        Language::TypeScript | Language::Tsx => node
+            .child_by_field_name("function")
+            .or_else(|| node.child_by_field_name("constructor")),
+        Language::Lua => node.child_by_field_name("name"),
+        Language::Rust if node.kind() == "macro_invocation" => node.child_by_field_name("macro"),
+        _ => None,
+    };
+    if let Some(callable) = callable {
+        let name = text(callable, source);
+        let module = match language {
+            Language::TypeScript | Language::Tsx => matches!(
+                name.as_str(),
+                "require"
+                    | "import"
+                    | "import.meta.glob"
+                    | "import.meta.globEager"
+                    | "Worker"
+                    | "SharedWorker"
+                    | "URL"
+            ),
+            Language::Lua => matches!(name.as_str(), "require" | "dofile" | "loadfile"),
+            Language::Rust => matches!(name.as_str(), "include" | "include_str" | "include_bytes"),
+            _ => false,
+        };
+        if module {
+            let args = node
+                .child_by_field_name("arguments")
+                .or_else(|| node.child_by_field_name("token_tree"))
+                .or_else(|| node.named_child(1));
+            let literal = args.and_then(|args| first_string_child(args, source));
+            if let Some(raw) = literal {
+                if !matches!(name.as_str(), "require" | "import" | "dofile" | "loadfile") {
+                    // URL paths without a relative prefix are URLs, not local module references.
+                    if name != "URL" || is_relative(&raw) {
+                        imports.push(Import {
+                            public: false,
+                            type_only: false,
+                            raw,
+                            line: node.start_position().row as u32 + 1,
+                            kind: ImportKind::Resource,
+                            alias: None,
+                        });
+                    }
+                }
+            } else if !matches!(name.as_str(), "Worker" | "SharedWorker" | "URL") {
+                dynamic.push(format!(
+                    "line {}: non-literal {name} reference",
+                    node.start_position().row + 1
+                ));
+            }
+        }
+    }
+    let mut c = node.walk();
+    for child in node.named_children(&mut c) {
+        resources(child, source, language, imports, dynamic);
+    }
+}
+fn shadowed(node: Node<'_>, source: &[u8], language: Language) -> bool {
+    let name = text(node, source);
+    fn declared(
+        node: Node<'_>,
+        position: usize,
+        source: &[u8],
+        language: Language,
+        name: &str,
+    ) -> bool {
+        if matches!(
+            node.kind(),
+            "block"
+                | "function_declaration"
+                | "function_item"
+                | "function_literal"
+                | "closure_expression"
+        ) {
+            return false;
+        }
+        let fields: &[&str] = match node.kind() {
+            "short_var_declaration" => &["left"],
+            "var_spec" | "const_spec" if language == Language::Go => &["name"],
+            "parameter_declaration" | "variadic_parameter_declaration" => &["name"],
+            "parameter" | "let_declaration" => &["pattern"],
+            _ => &[],
+        };
+        let mut c = node.walk();
+        for field in fields {
+            for pattern in node.children_by_field_name(field, &mut c) {
+                let identifiers: Vec<_> = descendants(pattern, "identifier");
+                if identifiers.iter().any(|id| text(*id, source) == name)
+                    && (node.end_byte() <= position
+                        || pattern.byte_range().contains(&position)
+                        || matches!(
+                            node.kind(),
+                            "parameter"
+                                | "parameter_declaration"
+                                | "variadic_parameter_declaration"
+                        ))
+                {
+                    return true;
+                }
+            }
+        }
+        let mut c = node.walk();
+        node.named_children(&mut c)
+            .any(|child| declared(child, position, source, language, name))
+    }
+    let mut ancestor = node.parent();
+    while let Some(scope) = ancestor {
+        if matches!(
+            scope.kind(),
+            "block"
+                | "function_declaration"
+                | "function_item"
+                | "function_literal"
+                | "closure_expression"
+        ) {
+            let mut c = scope.walk();
+            if scope
+                .named_children(&mut c)
+                .any(|child| declared(child, node.start_byte(), source, language, &name))
+            {
+                return true;
+            }
+        }
+        ancestor = scope.parent();
+    }
+    false
+}
+
+fn has_token(node: Node<'_>, kind: &str) -> bool {
+    let mut c = node.walk();
+    node.children(&mut c).any(|n| n.kind() == kind)
 }
 
 #[cfg(test)]

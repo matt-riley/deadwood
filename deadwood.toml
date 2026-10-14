@@ -1,3 +1,9 @@
+# Fixtures intentionally contain dead code and unresolved imports.
+exclude = ["tests/fixtures"]
+
+[workspaces."backends/go"]
+project = ["**/*.go"]
+
 # Optional project configuration.
 # entries = ["src/main.ts"]
 # exclude = ["generated"]
