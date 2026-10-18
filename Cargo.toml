@@ -1,6 +1,6 @@
 [package]
 name = "deadwood-cli"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Find unused files, dependencies and symbols across TypeScript, Go, Rust and Lua"
 license = "MIT"
