@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 set -eu
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # Verification must not accidentally reuse a stale binary or build artifact.
 rm -rf target

@@ -27,7 +27,7 @@ if command -v mise >/dev/null 2>&1; then
     actionlint_bin=$(mise which actionlint 2>/dev/null || true)
 fi
 if [ -n "$actionlint_bin" ]; then
-    (cd "$checkout" && ACTIONLINT_BIN="$actionlint_bin" .pi/verify)
+    (cd "$checkout" && ACTIONLINT_BIN="$actionlint_bin" .pi/verify/run.sh)
 else
-    (cd "$checkout" && .pi/verify)
+    (cd "$checkout" && .pi/verify/run.sh)
 fi

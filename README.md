@@ -265,9 +265,14 @@ mise run coverage
 crap src --coverage lcov.info --diff --fail-above
 crap backends/go --coverage backends/go/coverage.out --diff --fail-above
 target/release/deadwood . --semantic-go --fail-on high
-.pi/verify
+.pi/verify/run.sh
 .pi/verify-clean
+.pi/verify/doctor.sh
 ```
+
+`.pi/verify/SKILL.md` is the verification recipe: how to drive the real CLI
+against a throwaway project, what to observe for each feature, and what is
+known broken.
 
 `tests/fixtures/knip-ts` compares findings with pinned Knip `6.41.0`;
 any mismatch fails the test. Node.js/npm are required for that comparison.
