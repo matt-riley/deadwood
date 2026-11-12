@@ -26,7 +26,7 @@ jobs:
     # Needs the commit that taught homebrew-formula.yml to mint from a GitHub
     # App (4.1.0); that lets the tap run on a short-lived installation token
     # scoped to one repository instead of a long-lived PAT.
-    uses: matt-riley/matt-riley-ci/.github/workflows/homebrew-formula.yml@0a310f1286537ed4fd000af4b35cd6459b00448d
+    uses: matt-riley/matt-riley-ci/.github/workflows/homebrew-formula.yml@002d16c00bc74ebced433f0a16187c9b13451194 # v4.2.0
     with:
       # A tag push or a dispatch at the tag both land here with ref_name set to
       # the tag, which is the ref homebrew-formula.yml will re-check.
